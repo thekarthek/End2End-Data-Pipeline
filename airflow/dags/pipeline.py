@@ -1,0 +1,226 @@
+from __future__ import annotations
+import json
+import logging
+import os
+from datetime import datetime, timedelta
+from uuid import UUID
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except ImportError:
+    from backports.zoneinfo import ZoneInfo  # For test on spark which has python 3.8
+
+import clickhouse_connect
+import pyarrow as pa
+import pyarrow.fs as fs
+import pyarrow.parquet as pq
+import requests
+from airflow.hooks.base import BaseHook
+from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
+from airflow.sdk import dag, task
+from clickhouse_connect.driver.exceptions import ClickHouseError
+from dotenv import load_dotenv
+from minio import Minio
+from minio.error import S3Error
+
+row_type = tuple[UUID, UUID, UUID, str, datetime, int, str, int | None, int | None]
+
+load_dotenv()
+
+schema = pa.schema([
+    pa.field('event_type', pa.string()),
+    pa.field('status', pa.string()),
+])
+
+logger = logging.getLogger(__name__)
+
+CLICKHOUSE_CONN_NAME = os.environ['CLICKHOUSE_CONN_NAME']
+MINIO_CONN_NAME = os.environ['MINIO_CONN_NAME']
+SPARK_CONN_NAME = os.environ['SPARK_CONN_NAME']
+SPARK_APPLICATION_PATH = os.environ['SPARK_APPLICATION_PATH']
+MINIO_BUCKET_NAME = os.environ['MINIO_BUCKET_NAME']
+
+
+def get_minio_client() -> Minio:
+    minio_conn = BaseHook.get_connection(MINIO_CONN_NAME)
+    minio_client = Minio(
+        endpoint=minio_conn.extra_dejson.get('host').replace('http://', ''),
+        access_key=minio_conn.login,
+        secret_key=minio_conn.password,
+        secure=False
+    )
+    return minio_client
+
+
+@dag(
+    dag_id='clickHouse_pyspark_dashboard',
+    description='Extract data from ClickHouse, stream to minio, run spark analysis, report to dashboard.',
+    schedule='* * * * *',
+    start_date=datetime(2025, 8, 9, tzinfo=ZoneInfo('UTC')),
+    default_args={
+        'retries': 1,
+        'retry_delay': timedelta(seconds=3),
+    },
+    max_active_runs=2,
+    catchup=False,
+    doc_md="""
+    ### ETAR Pipeline
+    1. Extract the previous minute data from ClickHouse and stream it into MinIO.
+    2. Analyze the data with Spark.
+    3. Send the analysis result to the dashboard API.
+    """,
+    is_paused_upon_creation=False,
+    fail_fast=True,
+)
+def etar_pipeline() -> None:
+    """Extract-Transform-Analyze-Report Pipeline:
+        1- Stream the previous minute data from ClickHouse into MinIO as a Parquet file.
+        2- Trigger Spark analysis.
+        3- Report the result back to the dashboard.
+    """
+    
+    @task
+    def stream_from_clickhouse_to_minio(data_interval_start: datetime) -> str:
+        """Stream data from ClickHouse to MinIO, return the s3a file path if a Parquet file was stored, otherwise return the file name.
+        
+        Args:
+            data_interval_start: Task start time. Comes from Airflow.
+        
+        Returns:
+            MinIO path of the file or the timestamp converted to string.
+        
+        Raises:
+            ClickHouseError: If ClickHouse error happens.
+            S3Error: If MinIO error happens.
+        """
+        ch_conn = BaseHook.get_connection(CLICKHOUSE_CONN_NAME)
+        clickhouse_client = clickhouse_connect.get_client(
+            host=ch_conn.host,
+            port=ch_conn.port,
+            user=ch_conn.login,
+            password=ch_conn.password,
+            database=ch_conn.schema,
+        )
+        
+        minio_conn = BaseHook.get_connection(MINIO_CONN_NAME)
+        s3_fs = fs.S3FileSystem(
+            access_key=minio_conn.login,
+            secret_key=minio_conn.password,
+            endpoint_override=minio_conn.extra_dejson['host']
+        )
+        
+        timestamp = data_interval_start.astimezone(ZoneInfo('Asia/Tehran')).replace(second=0, microsecond=0) - timedelta(minutes=1)
+        timestamp_str = timestamp.strftime('%Y-%m-%d_%H-%M')
+        parquet_path = f'{MINIO_BUCKET_NAME}/{timestamp_str}.parquet'
+        
+        table = os.environ['CLICKHOUSE_TABLE']
+        query = 'SELECT event_type, status FROM %(table)s WHERE event_minute = %(timestamp)s;'
+        total_rows = 0
+        try:
+            with (
+                s3_fs.open_output_stream(path=parquet_path) as s3_stream,
+                pq.ParquetWriter(where=s3_stream, schema=schema) as writer,
+                clickhouse_client.query_df_stream(
+                    query=query,
+                    parameters={'table': table, 'timestamp': timestamp},
+                    settings={'max_block_size': 100000}
+                ) as ch_stream
+            ):
+                for df_chunk in ch_stream:
+                    if df_chunk.empty:
+                        break
+                    total_rows += len(df_chunk)
+                    
+                    table = pa.Table.from_pandas(df=df_chunk, schema=schema, preserve_index=False)
+                    writer.write_table(table=table)
+        except ClickHouseError:
+            logger.exception('ClickHouse error occurred while streaming from ClickHouse to MinIO.')
+            raise
+        except S3Error:
+            logger.exception('MinIO error occured while streaming from ClickHouse to MinIO.')
+            raise
+        except Exception:
+            logger.exception('Unexpected error occured while streaming from ClickHouse to MinIO.')
+            raise
+        finally:
+            clickhouse_client.close()
+        
+        if total_rows == 0:
+            logger.warning('No data found for minute: %s.', timestamp_str)
+            s3_fs.delete_file(parquet_path)
+            return 's3a://' + parquet_path.replace('.parquet', '')
+        
+        logger.info('Successfully uploaded Parquet file to %s. Number of rows written: %d', parquet_path, total_rows)
+        
+        return 's3a://' + parquet_path
+    
+    file_path = stream_from_clickhouse_to_minio()
+    
+    spark_analysis = SparkSubmitOperator(
+        task_id='spark_analysis',
+        conn_id=SPARK_CONN_NAME,
+        application=SPARK_APPLICATION_PATH,
+        application_args=[file_path],
+        deploy_mode='client',
+        conf={
+            'spark.hadoop.fs.s3a.endpoint': f'{{{{ conn.{MINIO_CONN_NAME}.extra_dejson.get("host") }}}}',
+            'spark.hadoop.fs.s3a.access.key': f'{{{{ conn.{MINIO_CONN_NAME}.login }}}}',
+            'spark.hadoop.fs.s3a.secret.key': f'{{{{ conn.{MINIO_CONN_NAME}.password }}}}',
+            'spark.hadoop.fs.s3a.path.style.access': 'true',
+            'spark.hadoop.fs.s3a.impl': 'org.apache.hadoop.fs.s3a.S3AFileSystem',
+            'spark.hadoop.fs.s3a.connection.ssl.enabled': 'false',
+            'spark.eventLog.enabled': os.environ['SPARK_EVENT_LOG_ENABLED'],
+            'spark.eventLog.dir': '/opt/airflow/logs/spark',
+        },
+        driver_memory='512m',
+        executor_memory='512m',
+        executor_cores=2,
+        num_executors=2,
+        verbose=False
+    )
+    
+    @task
+    def send_to_dashboard(file_path: str) -> None:
+        """Send analysis result to the dashboard api.
+        
+        Args:
+            file_path: MinIO path for the analysis report.
+        
+        Raises:
+            S3Error: If the file cannot be fetched from MinIO.
+            JSONDecodeError: If the file contains invalid JSON.
+            RequestException: If the dashboard API request fails.
+        """
+        if 'parquet' in file_path:
+            file_path = file_path.replace('parquet', 'json')
+        else:
+            file_path += '.json'
+        
+        file_name = file_path.split(os.sep)[-1]
+        minio_client = get_minio_client()
+        minio_response = None
+        try:
+            minio_response = minio_client.get_object(bucket_name=MINIO_BUCKET_NAME, object_name=file_name)
+            result = json.loads(minio_response.read())
+            dashboard_response = requests.post(url=os.environ['DASHBOARD_API_URL'], json=result)
+            dashboard_response.raise_for_status()
+        except S3Error:
+            logger.exception('Failed to fetch %s from MinIO', file_name)
+            raise
+        except json.JSONDecodeError:
+            logger.exception('Invalid JSON payload in %s', file_name)
+            raise
+        except requests.RequestException:
+            logger.exception('Dashboard API request failed for %s', file_name)
+            raise
+        except Exception:
+            logger.exception('An unexpected in send_to_dashboard')
+            raise
+        finally:
+            if minio_response:
+                minio_response.close()
+                minio_response.release_conn()
+    
+    file_path >> spark_analysis >> send_to_dashboard(file_path=file_path)
+
+
+etar_pipeline()
